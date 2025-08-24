@@ -1,0 +1,210 @@
+# Processing raw reads to generating MAGs
+module load chpc/BIOMODULES
+module load bbmap
+module load SPAdes
+module load samtools
+module load MetaBAT/2.15
+module load checkm
+
+cd $PBS_O_WORKDIR
+'''
+mkdir QCReads
+for file1 in RawReads/*_R1_001.fastq.gz
+do
+        file2=${file1/_R1_001.fastq.gz/_R2_001.fastq.gz}
+        out1=${file1##RawReads/}
+        out2=${file2##RawReads/}
+        bbduk.sh ktrim=r ordered minlen=51 minlenfraction=0.33 mink=11 \
+        tbo tpe rcomp=f k=23 ow=t hdist=1 ftm=5 zl=4 \
+        in1=$file1 in2=$file2 \
+        ref=/apps/chpc/bio/bbmap/resources/adapters.fa \
+        out1=QCReads/${out1%%_001.fastq.gz}_step1.fastq.gz \
+        out2=QCReads/${out2%%_001.fastq.gz}_step1.fastq.gz
+done
+
+for file1 in QCReads/*_R1_step1.fastq.gz
+do
+        file2=${file1/_R1_step1.fastq.gz/_R2_step1.fastq.gz}
+        bbduk.sh maq=20 trimq=20 qtrim=rl ordered ow=t maxns=1 minlen=51 \
+        minlenfraction=0.33 k=25 hdist=1 zl=4 cf=t \
+        ref=/apps/chpc/bio/bbmap/resources/sequencing_artifacts.fa.gz \
+        in1=$file1 in2=$file2 \
+        out1=${file1%%_step1.fastq.gz}_step2.fastq.gz \
+        out2=${file2%%_step1.fastq.gz}_step2.fastq.gz
+done
+
+for file1 in QCReads/*_R1_step2.fastq.gz
+do
+        file2=${file1/_R1_step2.fastq.gz/_R2_step2.fastq.gz}
+        bbduk.sh ordered ow=t k=20 hdist=1 zl=4 in1=$file1 in2=$file2 \
+        out1=${file1%%_step2.fastq.gz}_step3.fastq.gz \
+        out2=${file2%%_step2.fastq.gz}_step3.fastq.gz \
+        ref=/apps/chpc/bio/bbmap/resources/short.fa
+done
+
+for file1 in QCReads/*_R1_step3.fastq.gz
+do
+        file2=${file1/_R1_step3.fastq.gz/_R2_step3.fastq.gz}
+        tadpole.sh in1=$file1 in2=$file2 \
+        out1=${file1%%_step3.fastq.gz}_qc.fastq.gz \
+        out2=${file2%%_step3.fastq.gz}_qc.fastq.gz mode=correct k=50
+done
+
+# spades assembly
+rm QCReads/*step*
+'''
+for r1 in QCReads/*_R1_qc.fastq.gz
+do
+        r2=${r1/_R1_qc.fastq.gz/_R2_qc.fastq.gz}
+        out=${r1##QCReads/}
+        if [ ! -d spadesAssemblies/${out%%_R1_qc.fastq.gz} ]
+        then
+                spades.py --meta -1 $r1 -2 $r2 \
+                -t 48 -o spadesAssemblies/${out%%_R1_qc.fastq.gz}
+        fi
+done
+
+mkdir contigs1500bp
+for file in spadesAssemblies/*/contigs.fasta
+do
+	out=${file##spadesAssemblies/}
+	reformat.sh in=${file} out=contigs1500bp/${out%%/contigs.fasta}.fasta \
+	minlength=1500
+done
+
+# binning
+for contig in contigs1500bp/*.fasta
+do
+	reads=${contig##contigs1500bp/}
+        bbmap.sh in1=QCReads/${reads%%.fasta}_R1_qc.fastq.gz \
+	in2=QCReads/${reads%%.fasta}_R2_qc.fastq.gz \
+	out=${contig%%.fasta}.sam \
+	covstats=${contig%%.fasta}_covstats.txt \
+	ref=${contig} \
+	bamscript=bs.sh
+	sh bs.sh
+	rm bs.sh
+done
+
+rm -r ref
+
+for bam in contigs1500bp/*_sorted.bam
+do
+	jgi_summarize_bam_contig_depths \
+	--outputDepth ${bam%%_sorted.bam}.depth $bam
+done
+
+mkdir metaBins2
+for contig in contigs1500bp/*.fasta
+do
+	out=${contig##contigs1500bp/}
+	metabat2 -i $contig -a ${contig%%.fasta}.depth \
+	-o metaBins2/${out%%.fasta}.metabat -t 48 -m 1500
+done
+
+#rm metaBins2/*.lowDepth.fa
+#rm metaBins2/*.tooShort.fa
+
+# Running checkM
+checkm lineage_wf -t 48 -x fa metaBins2 checkmBins
+checkm qa -t 48 -o 2 --tab_table --file CheckM.All.Meta.txt \
+checkmBins/lineage.ms checkmBins
+
+module unload bbmap
+module unload SPAdes
+module unload samtools
+module unload MetaBAT/2.15
+module unload checkm
+
+# MAGs taxonomic classification
+module load GTDB-Tk/1.7.0
+
+awk -F '\t' ' $6 >= 50 && $7 < 10 ' CheckM.All.Meta.txt > CheckM.HighMedQual.txt
+cut -f 1 CheckM.HighMedQual.txt > ToGTDBtk.txt
+mkdir HighMedQualMAGs
+while read line
+do
+	rsync -avh metaBins2/${line}.fa HighMedQualMAGs/
+done < ToGTDBtk.txt
+
+gtdbtk classify_wf --extension fa --genome_dir metaBins2 \
+--out_dir metaBins2GTDBtk --cpus 48
+
+
+# Use prodigal to transform nucleotide sequences (contigs and MAGs) into protein seq
+module load chpc/BIOMODULES
+module load prodigal
+
+for items in *.fasta; do prodigal -i $items -d /$items.genes -a /$items.faa ; 
+
+done
+
+
+# Run HMM scan script
+module load chpc/BIOMODULES
+module load hmmer
+
+for i in /*.faa; do hmmscan -T 40 --domtbl $i\.hmmscan_output DMSP_HMM_Profile $i;
+
+done
+
+# DMSP genes taxonomy using DIAMOND
+module load chpc/BIOMODULES
+module load diamond
+
+for i in *.faa; do
+diamond blastp -q "$i" \
+-d /mnt/lustre/bsp/DB/DIAMOND/nr -f 6 \
+qseqid sseqid pident length mismatch gapopen qstart qend sstart \
+send evalue bitscore stitle \
+-o "${i%.faa}.diamond.tsv" --sensitive -e 1e-50
+
+done
+
+# Taxonkit for retrieving taxonomic rank for genes involved in DMSP production and degradation 
+module add chpc/BIOMODULES anaconda/3
+conda init bash 
+source ~/.bashrc
+conda activate taxonkit
+
+# extract taxonomy names from the last column
+sed -n 's/.*\[\([^]]*\)\]$/\1/p' *.diamond.tsv > taxonomy_names.txt
+# now taxonomy names to taxaID
+taxonkit name2taxid --data-dir /mnt/lustre/bsp/DB/taxonomy taxonomy_names.txt > taxids.txt
+# extract taxaID only
+awk '{print $NF}' taxids.txt > only_ids.txt
+# getting taxonomic rank of this taxaID
+taxonkit lineage --data-dir /mnt/lustre/bsp/DB/taxonomy only_ids.txt > taxonomic_lineage.tsv
+
+
+#Read based taxonomy
+
+module load chpc/BIOMODULES
+module load kaiju
+
+mkdir kaijuOutRNA
+for r1 in path/to/directory/*_1_paired.fq.gz
+do
+        r2=${r1/_1_paired.fq.gz/_2_paired.fq.gz}
+        out=${r1##../path/to/directory/}
+        kaiju -z 24 -t /mnt/lustre/bsp/DB/KAIJU/nodes.dmp \
+        -f /mnt/lustre/bsp/DB/KAIJU/kaiju_db_nr_euk.fmi \
+        -i $r1 -j $r2 -o kaijuOutRNA/${out%%_1_paired.fq.gz}.out
+done
+
+for file in kaijuOutRNA/*.out
+do
+        kaiju2krona -t /mnt/lustre/bsp/DB/KAIJU/nodes.dmp \
+        -n /mnt/lustre/bsp/DB/KAIJU/names.dmp -i $file -o ${file}.krona
+done
+
+kaiju2table -t /mnt/lustre/bsp/DB/KAIJU/nodes.dmp -n /mnt/lustre/bsp/DB/KAIJU/names.dmp \
+-p -r phylum -e -u -o kaijuOutRNA/summaryPhylum.tsv kaijuOutRNA/*.out
+kaiju2table -t /mnt/lustre/bsp/DB/KAIJU/nodes.dmp -n /mnt/lustre/bsp/DB/KAIJU/names.dmp \
+-p -r class -e -u -o kaijuOutRNA/summaryClass.tsv kaijuOutRNA/*.out
+kaiju2table -t /mnt/lustre/bsp/DB/KAIJU/nodes.dmp -n /mnt/lustre/bsp/DB/KAIJU/names.dmp \
+-p -r order -e -u -o kaijuOutRNA/summaryOrder.tsv kaijuOutRNA/*.out
+kaiju2table -t /mnt/lustre/bsp/DB/KAIJU/nodes.dmp -n /mnt/lustre/bsp/DB/KAIJU/names.dmp \
+-p -r family -e -u -o kaijuOutRNA/summaryFamily.tsv kaijuOutRNA/*.out
+kaiju2table -t /mnt/lustre/bsp/DB/KAIJU/nodes.dmp -n /mnt/lustre/bsp/DB/KAIJU/names.dmp \
+-p -r genus -e -u -o kaijuOutRNA/summaryGenus.tsv kaijuOutRNA/*.out
